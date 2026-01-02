@@ -6,7 +6,7 @@ from openai import OpenAI
 # ---------------- config ----------------
 MODEL = "gpt-5"
 MAX_FILE_CHARS = 8_000
-INCLUDE_EXTENSIONS = {".txt", ".md", ".py", ".json", ".yaml", ".yml"}
+INCLUDE_EXTENSIONS = {".txt", ".md", ".py", ".json", ".yaml", ".yml", ".tf", ".tfvars"}
 FILE_CONTEXT_TAG = "__FILE_CONTEXT__"
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
@@ -17,16 +17,27 @@ context: list[dict] = []
 # Directory change tracking (for smart reload)
 _last_sig = None
 
-def build_file_context_message() -> dict | None:
+
+def project_dir() -> Path:
+    """
+    Directory to load files from:
+    - If the user runs:   python path/to/agent.py ...
+      then files should come from the *current working directory* (cwd),
+      i.e., where they invoked the command from.
+    """
+    return Path.cwd().resolve()
+
+
+def build_file_context_message(base_dir: Path) -> dict | None:
     """
     Build a single system message containing the contents of eligible files
-    in the same directory as this script (agent.py).
+    in `base_dir` (the directory the user invoked the script from).
     """
-    base_dir = Path(__file__).resolve().parent
-    agent_filename = Path(__file__).name
+    included: list[str] = []
+    file_blocks: list[str] = []
 
-    included = []
-    file_blocks = []
+    # If agent.py happens to be in the same dir, skip it; otherwise this is harmless.
+    agent_filename = Path(__file__).name
 
     for path in sorted(base_dir.iterdir()):
         if not path.is_file():
@@ -43,7 +54,7 @@ def build_file_context_message() -> dict | None:
         except Exception as e:
             print(f"[warn] skipped {path.name}: {e}")
 
-    print(f"[info] loaded {len(included)} files: {included}")
+    print(f"[info] loaded {len(included)} files from {base_dir}: {included}")
 
     if not file_blocks:
         return None
@@ -52,6 +63,7 @@ def build_file_context_message() -> dict | None:
         "role": "system",
         "content": (
             f"{FILE_CONTEXT_TAG}\n"
+            f"Project directory: {base_dir}\n"
             "You have access to the following files from the project directory. "
             "Use them as context when answering. If the user asks about a file, "
             "prefer quoting the relevant snippet and explaining it.\n\n"
@@ -61,7 +73,7 @@ def build_file_context_message() -> dict | None:
 
 
 def add_initial_file_context():
-    msg = build_file_context_message()
+    msg = build_file_context_message(project_dir())
     if msg:
         # Keep file context at the very front of the conversation
         context.insert(0, msg)
@@ -74,22 +86,23 @@ def reload_file_context():
     global context
     # Remove prior file-context system messages (only those we added)
     context = [
-        m for m in context
+        m
+        for m in context
         if not (m.get("role") == "system" and str(m.get("content", "")).startswith(FILE_CONTEXT_TAG))
     ]
-    # Add updated file context back to the front
+    # Add updated file context back to the front (from cwd)
     add_initial_file_context()
 
 
-def directory_signature() -> tuple:
-    base_dir = Path(__file__).resolve().parent
+def directory_signature(base_dir: Path) -> tuple:
     agent_filename = Path(__file__).name
 
     sig = []
     for p in sorted(base_dir.iterdir()):
         if p.is_file() and p.name != agent_filename and p.suffix.lower() in INCLUDE_EXTENSIONS:
             try:
-                sig.append((p.name, p.stat().st_mtime_ns, p.stat().st_size))
+                st = p.stat()
+                sig.append((p.name, st.st_mtime_ns, st.st_size))
             except Exception:
                 pass
     return tuple(sig)
@@ -101,7 +114,9 @@ def call():
 
 def process(prompt: str) -> str:
     global _last_sig
-    sig = directory_signature()
+
+    base_dir = project_dir()
+    sig = directory_signature(base_dir)
     if sig != _last_sig:
         reload_file_context()
         _last_sig = sig
@@ -113,12 +128,11 @@ def process(prompt: str) -> str:
     return output
 
 
-
 def main():
     add_initial_file_context()
 
     # One-shot CLI usage:
-    #   python agent.py "your prompt here"
+    #   python /path/to/agent.py "your prompt here"
     if len(sys.argv) > 1:
         prompt = " ".join(sys.argv[1:])
         print(process(prompt))
